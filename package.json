@@ -1,0 +1,20 @@
+{
+  "name": "clinical-trial-endpoint-audit-escrow",
+  "version": "1.0.0",
+  "description": "Autonomous Biopharmaceutical Licensing Milestone Escrow & ClinicalTrials.gov / FDA Primary Endpoint Multi-Validator Consensus Adjudicator on GenLayer",
+  "type": "module",
+  "scripts": {
+    "test": "python test/test_clinical_trial_audit_escrow.py",
+    "deploy": "node scripts/deploy_clinical_trial_audit_escrow.mjs"
+  },
+  "keywords": [
+    "genlayer",
+    "intelligent-contracts",
+    "clinical-trials",
+    "biopharma",
+    "fda",
+    "milestone-escrow"
+  ],
+  "author": "metaremover <metaremover@users.noreply.github.com>",
+  "license": "MIT"
+}
