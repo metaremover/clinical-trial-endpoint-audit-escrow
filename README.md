@@ -4,7 +4,7 @@
 **Target Account**: [`metaremover`](https://github.com/metaremover)  
 **Repository**: [https://github.com/metaremover/clinical-trial-endpoint-audit-escrow](https://github.com/metaremover/clinical-trial-endpoint-audit-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0x61AF74c41475b052a77087aAd0E3Ae79D0A577af`](https://explorer-studio.genlayer.com/address/0x61AF74c41475b052a77087aAd0E3Ae79D0A577af)  
+**Contract Address**: [`0x05aeFfE06ea65908223F747f722e6980b08eee0b`](https://explorer-studio.genlayer.com/address/0x05aeFfE06ea65908223F747f722e6980b08eee0b)  
 
 ---
 
@@ -25,7 +25,7 @@ When clinical trial results read out:
 `ClinicalTrialEndpointAuditEscrow` establishes an autonomous clinical escrow settlement court natively on GenLayer:
 - Escrows licensing milestone capital backed 100% by native funds (`@gl.public.write.payable`).
 - Restricts external evidence ingestion exclusively to authoritative trial registries and federal regulatory portals (`clinicaltrials.gov`, `fda.gov`, `ema.europa.eu`, `nih.gov`), eliminating SSRF and arbitrary URL spoofing.
-- Executes multi-validator equivalence consensus (`gl.exec_prompt` + `gl.get_webpage`) to audit trial readouts:
+- Executes multi-validator equivalence consensus via GenLayer Equivalence Principle (`gl.eq_principle.prompt_non_comparative` + `gl.nondet.web.render`) where all validators independently refetch official clinical protocol readouts and audit endpoints:
   - **ENDPOINT_MET**: Verifies primary endpoint achievement with statistical significance ($p < 0.05$) and no safety holds $\rightarrow$ Automatically disburses 100% milestone funds to the biotech recipient and refunds the claimant's dispute bond.
   - **CLAIM_REFUTED**: Frivolous assertion or trial failure ($p \ge 0.05$) $\rightarrow$ Slashes dispute bond to the sponsor's indemnity balance.
   - **Consensual Settlement**: Sponsor can approve milestone disbursement at any point prior to deadline.

@@ -7,22 +7,14 @@ import re
 from datetime import datetime, timezone
 
 
-class MockGL:
-    def __init__(self):
-        self.transfers = []
-        self.mock_web_responses = {}
-        self.fail_web_fetch = False
-        self.simulate_transfer_fail = False
+class MockWeb:
+    def __init__(self, gl):
+        self.gl = gl
 
-    def emit_transfer(self, recipient: str, amount: int):
-        if self.simulate_transfer_fail:
-            raise RuntimeError("Simulated EVM transfer failure")
-        self.transfers.append({"recipient": str(recipient).lower(), "amount": int(amount)})
-
-    def get_webpage(self, url: str) -> str:
-        if self.fail_web_fetch:
+    def render(self, url: str, mode: str = "text") -> str:
+        if self.gl.fail_web_fetch:
             raise RuntimeError("Simulated network timeout connecting to ClinicalTrials.gov")
-        return self.mock_web_responses.get(
+        return self.gl.mock_web_responses.get(
             url,
             "<html><body><h1>ClinicalTrials.gov Protocol Record: NCT04589211</h1>"
             "<p>Phase 3 Randomized Double-Blind Oncology Registration Trial. "
@@ -30,13 +22,45 @@ class MockGL:
             "Safety profile acceptable; no clinical holds.</p></body></html>"
         )
 
-    def exec_prompt(self, prompt: str) -> str:
-        return json.dumps({
+
+class MockNondet:
+    def __init__(self, gl):
+        self.web = MockWeb(gl)
+
+
+class MockEqPrinciple:
+    def __init__(self, gl):
+        self.gl = gl
+
+    def prompt_non_comparative(self, get_input_fn, task="", criteria=""):
+        input_data = get_input_fn()
+        if self.gl.corrupt_llm_json:
+            return "This is a corrupted non-JSON LLM response that would normally cause JSONDecodeError."
+        return self.gl.consensus_return_value
+
+
+class MockGL:
+    def __init__(self):
+        self.transfers = []
+        self.mock_web_responses = {}
+        self.fail_web_fetch = False
+        self.simulate_transfer_fail = False
+        self.corrupt_llm_json = False
+        self.nondet = MockNondet(self)
+        self.eq_principle = MockEqPrinciple(self)
+        self.consensus_return_value = json.dumps({
+            "nct_matched": True,
             "endpoint_met": True,
             "p_value": 0.0018,
             "safety_hold": False,
+            "verdict": "ENDPOINT_ACHIEVED",
             "rationale": "Phase 3 clinical trial met primary PFS endpoint with robust statistical significance (p=0.0018)."
         })
+
+    def emit_transfer(self, recipient: str, amount: int):
+        if self.simulate_transfer_fail:
+            raise RuntimeError("Simulated EVM transfer failure")
+        self.transfers.append({"recipient": str(recipient).lower(), "amount": int(amount)})
 
 
 class MockClinicalTrialEndpointAuditEscrow:
@@ -316,18 +340,44 @@ class MockClinicalTrialEndpointAuditEscrow:
 
         m = self.milestones[clm["milestone_id"]]
 
-        try:
-            trial_text = self.gl.get_webpage(clm["registry_url"])
-        except Exception:
-            raise AssertionError("[ERR_EVIDENCE_FETCH_FAILED] Consensus could not fetch trial readout.")
+        reg_url = clm["registry_url"]
+        nct_id = m["trial_nct_id"]
+        primary_endpoint = m["target_primary_endpoint"]
+        claimed_pval_str = str(int(clm["reported_p_value_bp"]) / 10000.0)
 
-        assert trial_text is not None and len(trial_text.strip()) >= 30, "[ERR_EVIDENCE_FETCH_FAILED] Response too short."
+        def get_input() -> str:
+            try:
+                raw_data = self.gl.nondet.web.render(reg_url, mode="text")
+            except Exception:
+                raise AssertionError("[ERR_EVIDENCE_FETCH_FAILED] Consensus could not fetch clinical trial readout.")
+            assert raw_data is not None and len(raw_data.strip()) >= 30, \
+                "[ERR_EVIDENCE_FETCH_FAILED] Response too short."
+            cleaned = re.sub(r'<[^>]+>', ' ', raw_data)
+            return f"NCT: {nct_id}\nEndpoint: {primary_endpoint}\nClaimed p-val: {claimed_pval_str}\n\n{cleaned}"
 
-        # HTML sanitization (HIGH-02)
-        cleaned_text = re.sub(r'<script[^>]*>.*?</script>', ' ', trial_text, flags=re.DOTALL | re.IGNORECASE)
-        cleaned_text = re.sub(r'<style[^>]*>.*?</style>', ' ', cleaned_text, flags=re.DOTALL | re.IGNORECASE)
-        cleaned_text = re.sub(r'<[^>]+>', ' ', cleaned_text)
-        cleaned_text = ' '.join(cleaned_text.split())
+        task = "Auditor Task: Analyze clinical trial readout."
+        criteria = "Auditor Criteria: Independently verify trial endpoints."
+
+        if simulate_parse_error:
+            self.gl.corrupt_llm_json = True
+        elif custom_endpoint_met is not None and custom_p_val is not None:
+            self.gl.corrupt_llm_json = False
+            self.gl.consensus_return_value = json.dumps({
+                "nct_matched": True,
+                "endpoint_met": custom_endpoint_met,
+                "p_value": custom_p_val,
+                "safety_hold": custom_safety if custom_safety is not None else False,
+                "verdict": "ENDPOINT_ACHIEVED" if custom_endpoint_met else "ENDPOINT_FAILED",
+                "rationale": "Test trial adjudication verdict."
+            })
+        else:
+            self.gl.corrupt_llm_json = False
+
+        consensus_result = self.gl.eq_principle.prompt_non_comparative(
+            get_input,
+            task=task,
+            criteria=criteria
+        )
 
         parse_valid = False
         parsed_endpoint_met = False
@@ -335,16 +385,13 @@ class MockClinicalTrialEndpointAuditEscrow:
         parsed_safety = True
         rationale = "Consensus fallback resolution."
 
-        if simulate_parse_error:
-            parse_valid = False
-        elif custom_endpoint_met is not None and custom_p_val is not None:
-            raw_resp = json.dumps({
-                "endpoint_met": custom_endpoint_met,
-                "p_value": custom_p_val,
-                "safety_hold": custom_safety if custom_safety is not None else False,
-                "rationale": "Test trial adjudication verdict."
-            })
-            parsed = json.loads(raw_resp)
+        try:
+            clean_json = consensus_result.strip()
+            if "```json" in clean_json:
+                clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+            elif "```" in clean_json:
+                clean_json = clean_json.split("```")[1].split("```")[0].strip()
+            parsed = json.loads(clean_json)
             parsed_endpoint_met = bool(parsed.get("endpoint_met", False))
             raw_pval = parsed.get("p_value", 1.0)
             if isinstance(raw_pval, str):
@@ -353,25 +400,8 @@ class MockClinicalTrialEndpointAuditEscrow:
             parsed_safety = bool(parsed.get("safety_hold", False))
             rationale = parsed.get("rationale", "")
             parse_valid = True
-        else:
-            raw_resp = self.gl.exec_prompt("Prompt")
-            try:
-                clean_json = raw_resp.strip()
-                if "```json" in clean_json:
-                    clean_json = clean_json.split("```json")[1].split("```")[0].strip()
-                elif "```" in clean_json:
-                    clean_json = clean_json.split("```")[1].split("```")[0].strip()
-                parsed = json.loads(clean_json)
-                parsed_endpoint_met = bool(parsed.get("endpoint_met", False))
-                raw_pval = parsed.get("p_value", 1.0)
-                if isinstance(raw_pval, str):
-                    raw_pval = raw_pval.replace("<", "").replace("=", "").replace("p", "").strip()
-                parsed_p_val = float(raw_pval)
-                parsed_safety = bool(parsed.get("safety_hold", False))
-                rationale = parsed.get("rationale", "")
-                parse_valid = True
-            except Exception:
-                parse_valid = False
+        except Exception:
+            parse_valid = False
 
         # CRIT-01 Safe Inconclusive Fallback
         p_val_bp_derived = int(parsed_p_val * 10000)
