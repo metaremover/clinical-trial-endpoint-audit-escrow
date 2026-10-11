@@ -1,7 +1,6 @@
 # ClinicalTrialEndpointAuditEscrow
 ### Autonomous Biopharmaceutical Licensing Milestone Escrow & ClinicalTrials.gov / FDA Primary Endpoint Consensus Adjudicator
 **Protocol Standard**: GenLayer Intelligent Contract v0.2.1  
-**Target Account**: [`metaremover`](https://github.com/metaremover)  
 **Repository**: [https://github.com/metaremover/clinical-trial-endpoint-audit-escrow](https://github.com/metaremover/clinical-trial-endpoint-audit-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
 **Contract Address**: [`0x05aeFfE06ea65908223F747f722e6980b08eee0b`](https://explorer-studio.genlayer.com/address/0x05aeFfE06ea65908223F747f722e6980b08eee0b)  
