@@ -1,5 +1,6 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 import json
+import re
 import hashlib
 import urllib.parse
 import datetime
@@ -8,6 +9,7 @@ from genlayer import *
 
 
 STATUS_ACTIVE = "ACTIVE"
+STATUS_DISPUTED = "DISPUTED"
 STATUS_MILESTONE_ACHIEVED = "MILESTONE_ACHIEVED"
 STATUS_TRIAL_FAILED_REFUNDED = "TRIAL_FAILED_REFUNDED"
 STATUS_EXPIRED_REFUNDED = "EXPIRED_REFUNDED"
@@ -89,10 +91,15 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
        (clinicaltrials.gov, fda.gov, ema.europa.eu, nih.gov).
     7. Multi-Validator Equivalence Consensus: Consensus LLM verifies trial protocols, primary
        endpoint statistical significance (p < 0.05), and safety holds.
-    8. Metric-Bound Settlement: Milestone disbursement strictly binds to verified primary endpoint
-       success (p < 0.05) and confirmed consensus verdict.
-    9. Unreachable Registry Recovery: 7-day dispute bond refund safeguard for claimants.
-    10. Recoverable Pull-Pattern Balance: Failed disbursements credit claimable balances with
+    8. Safe Fallback Invariant (CRIT-01 Remediated): Any JSON parsing glitch or string p-value
+       defaults strictly to INCONCLUSIVE, fully preserving claimant bonds and preventing unjust slashing.
+    9. True Solvency Tracking (CRIT-02 Remediated): total_volume_locked decrements strictly when funds
+       successfully exit via native transfer; pending claimable balances remain in locked volume.
+    10. Dispute State Machine Lock (HIGH-01 Remediated): Milestones lock to STATUS_DISPUTED during claims,
+        preventing front-running settlement race conditions.
+    11. HTML Content Sanitation (HIGH-02 Remediated): Strips HTML tags and script bloat before prompt ingestion.
+    12. Unreachable Registry Recovery: 7-day dispute bond refund safeguard for claimants.
+    13. Recoverable Pull-Pattern Balance: Failed disbursements credit claimable balances with
         non-reverting, balance-preserving withdrawal semantics.
     """
 
@@ -301,11 +308,13 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         """
         Allows the sponsor to directly confirm endpoint achievement and disburse
         escrow funds to the licensor biotech recipient.
+        Prevents settlement if milestone is currently disputed (HIGH-01 Remediated).
         """
         clean_m_id = milestone_id.strip().upper()
         assert clean_m_id in self.milestones, "[ERR_MILESTONE_NOT_FOUND] Milestone record not found."
         milestone = self.milestones[clean_m_id]
-        assert milestone.status == STATUS_ACTIVE, "[ERR_MILESTONE_NOT_ACTIVE] Milestone is not currently active."
+        assert milestone.status == STATUS_ACTIVE, \
+            "[ERR_MILESTONE_NOT_ACTIVE] Milestone must be in ACTIVE status (cannot approve while DISPUTED or terminal)."
 
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Caller").lower()
         assert sender_hex == milestone.sponsor, \
@@ -318,12 +327,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         milestone.total_released_to_biotech += u256(escrow_amt)
         milestone.milestone_escrow_amount = u256(0)
         self.milestones[clean_m_id] = milestone
-
         self.total_milestones_released += u256(escrow_amt)
-        if int(self.total_volume_locked) >= escrow_amt:
-            self.total_volume_locked -= u256(escrow_amt)
-        else:
-            self.total_volume_locked = u256(0)
 
         transfer_succeeded = False
         try:
@@ -332,7 +336,12 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         except Exception:
             transfer_succeeded = False
 
-        if not transfer_succeeded:
+        if transfer_succeeded:
+            if int(self.total_volume_locked) >= escrow_amt:
+                self.total_volume_locked -= u256(escrow_amt)
+            else:
+                self.total_volume_locked = u256(0)
+        else:
             cur = int(self.claimable_balances.get(milestone.biotech_recipient, u256(0)))
             self.claimable_balances[milestone.biotech_recipient] = u256(cur + escrow_amt)
 
@@ -349,11 +358,13 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         """
         Allows the sponsor to reclaim milestone collateral if the trial deadline has elapsed
         without endpoint achievement.
+        Prevents settlement if milestone is currently disputed (HIGH-01 Remediated).
         """
         clean_m_id = milestone_id.strip().upper()
         assert clean_m_id in self.milestones, "[ERR_MILESTONE_NOT_FOUND] Milestone record not found."
         milestone = self.milestones[clean_m_id]
-        assert milestone.status == STATUS_ACTIVE, "[ERR_MILESTONE_NOT_ACTIVE] Milestone is not currently active."
+        assert milestone.status == STATUS_ACTIVE, \
+            "[ERR_MILESTONE_NOT_ACTIVE] Milestone must be in ACTIVE status (cannot reclaim while DISPUTED or terminal)."
 
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Caller").lower()
         assert sender_hex == milestone.sponsor, \
@@ -370,12 +381,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         milestone.total_refunded_to_sponsor += u256(escrow_amt)
         milestone.milestone_escrow_amount = u256(0)
         self.milestones[clean_m_id] = milestone
-
         self.total_milestones_refunded += u256(escrow_amt)
-        if int(self.total_volume_locked) >= escrow_amt:
-            self.total_volume_locked -= u256(escrow_amt)
-        else:
-            self.total_volume_locked = u256(0)
 
         transfer_succeeded = False
         try:
@@ -384,7 +390,12 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         except Exception:
             transfer_succeeded = False
 
-        if not transfer_succeeded:
+        if transfer_succeeded:
+            if int(self.total_volume_locked) >= escrow_amt:
+                self.total_volume_locked -= u256(escrow_amt)
+            else:
+                self.total_volume_locked = u256(0)
+        else:
             cur = int(self.claimable_balances.get(milestone.sponsor, u256(0)))
             self.claimable_balances[milestone.sponsor] = u256(cur + escrow_amt)
 
@@ -408,11 +419,17 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         """
         Submits an official clinical trial readout assertion referencing ClinicalTrials.gov / FDA.
         Backed by a mandatory claim bond via @gl.public.write.payable.
+        Enforces dispute state locking and deadline verification (HIGH-01, MED-03 Remediated).
         """
         clean_m_id = milestone_id.strip().upper()
         assert clean_m_id in self.milestones, "[ERR_MILESTONE_NOT_FOUND] Milestone record not found."
         milestone = self.milestones[clean_m_id]
-        assert milestone.status == STATUS_ACTIVE, "[ERR_MILESTONE_NOT_ACTIVE] Milestone is not currently active."
+        assert milestone.status == STATUS_ACTIVE, \
+            "[ERR_MILESTONE_NOT_ACTIVE] Milestone is not currently active (cannot file against DISPUTED or terminal milestones)."
+
+        now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+        assert now_utc <= int(milestone.milestone_deadline), \
+            "[ERR_DEADLINE_ELAPSED] Milestone deadline has already elapsed."
 
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Claimant").lower()
         clean_url = self._validate_registry_url(registry_url)
@@ -435,7 +452,6 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
             "[ERR_CLAIM_EXISTS] Duplicate claim fingerprint already filed. Regenerate nonce."
 
         new_c_id = "CLAIM_CLIN_" + str(int(self.total_claims_filed) + 1)
-        now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
         claim_rec = TrialEndpointClaimRecord(
             claim_id=new_c_id,
@@ -460,6 +476,10 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         self.total_claims_filed += 1
         self.total_volume_locked += u256(bond_val)
 
+        # Lock milestone into DISPUTED state to prevent front-running payout approval
+        milestone.status = STATUS_DISPUTED
+        self.milestones[clean_m_id] = milestone
+
         return (
             "CLAIM_FILED: " + new_c_id + " | Milestone: " + clean_m_id
             + " | NCT: " + milestone.trial_nct_id + " | Bond: " + str(bond_val) + " wei"
@@ -473,6 +493,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         """
         Executes multi-validator web ingestion and AI consensus audit of trial readout.
         Verifies primary endpoint achievement, statistical significance (p < 0.05), and safety status.
+        Implements Safe Fallback and Solvency Accounting (CRIT-01, CRIT-02 Remediated).
         """
         clean_c_id = claim_id.strip().upper()
         assert clean_c_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Target claim does not exist."
@@ -492,7 +513,12 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         assert trial_text is not None and len(trial_text.strip()) >= 30, \
             "[ERR_EVIDENCE_FETCH_FAILED] Clinical trial response was empty or insufficient (< 30 characters)."
 
-        sanitized_text = trial_text.replace('"""', "'''")[:3000]
+        # HTML Tag & Script Stripping to Prevent Prompt Starvation (HIGH-02 Remediated)
+        cleaned_text = re.sub(r'<script[^>]*>.*?</script>', ' ', trial_text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned_text = re.sub(r'<style[^>]*>.*?</style>', ' ', cleaned_text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned_text = re.sub(r'<[^>]+>', ' ', cleaned_text)
+        cleaned_text = ' '.join(cleaned_text.split())
+        sanitized_text = cleaned_text.replace('"""', "'''")[:6000]
 
         prompt = (
             "You are a GenLayer autonomous clinical trial biostatistics and FDA regulatory validator.\n"
@@ -504,7 +530,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
             "TASK: Evaluate whether the official clinical trial results confirm that the pre-specified primary endpoint was achieved with statistical significance (p < 0.05) and without catastrophic safety hold / futility termination.\n"
             "Respond STRICTLY in valid JSON with exactly four keys:\n"
             "\"endpoint_met\": boolean (true or false)\n"
-            "\"p_value\": float representing the reported p-value\n"
+            "\"p_value\": float or numerical string representing the reported p-value\n"
             "\"safety_hold\": boolean\n"
             "\"rationale\": a concise 1-sentence biostatistical summary."
         )
@@ -514,6 +540,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         parsed_p_value = 1.0
         parsed_safety_hold = True
         rationale = "Consensus fallback resolution."
+        parse_valid = False
 
         try:
             clean_json = raw_resp.strip()
@@ -523,20 +550,26 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
                 clean_json = clean_json.split("```")[1].split("```")[0].strip()
             parsed = json.loads(clean_json)
             parsed_endpoint_met = bool(parsed.get("endpoint_met", False))
-            parsed_p_value = float(parsed.get("p_value", 1.0))
+
+            raw_pval = parsed.get("p_value", 1.0)
+            if isinstance(raw_pval, str):
+                raw_pval = raw_pval.replace("<", "").replace("=", "").replace("p", "").strip()
+            parsed_p_value = float(raw_pval)
+
             parsed_safety_hold = bool(parsed.get("safety_hold", False))
             rationale = str(parsed.get("rationale", "")).strip()[:200]
+            parse_valid = True
         except Exception:
-            pass
+            parse_valid = False
 
-        # Strict Metric Binding: Primary Endpoint Met + p < 0.05 + No Safety Hold
+        # Strict Metric Binding (CRIT-01 Remediated: Safe Inconclusive Fallback)
         p_val_bp_derived = int(parsed_p_value * 10000)
-        if parsed_endpoint_met and p_val_bp_derived <= MAX_STATISTICAL_P_VALUE_BP and not parsed_safety_hold:
+        if parse_valid and parsed_endpoint_met and p_val_bp_derived <= MAX_STATISTICAL_P_VALUE_BP and not parsed_safety_hold:
             final_verdict = CLAIM_ENDPOINT_MET
-        elif not parsed_endpoint_met or p_val_bp_derived > MAX_STATISTICAL_P_VALUE_BP or parsed_safety_hold:
+        elif parse_valid and (not parsed_endpoint_met or p_val_bp_derived > MAX_STATISTICAL_P_VALUE_BP or parsed_safety_hold):
             final_verdict = CLAIM_REFUTED
         else:
-            final_verdict = CLAIM_INCONCLUSIVE
+            final_verdict = CLAIM_INCONCLUSIVE  # Safe fallback preserves claimant bond!
 
         now_utc = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
         clm.adjudicated_at = u256(now_utc)
@@ -554,23 +587,22 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
             milestone.status = STATUS_MILESTONE_ACHIEVED
             milestone.total_released_to_biotech += u256(milestone_amt)
             milestone.milestone_escrow_amount = u256(0)
-
             self.total_milestones_released += u256(milestone_amt)
-            total_disbursed = milestone_amt + bond_val
 
-            if int(self.total_volume_locked) >= total_disbursed:
-                self.total_volume_locked -= u256(total_disbursed)
-            else:
-                self.total_volume_locked = u256(0)
-
-            # 1. Disburse milestone funds to biotech recipient
+            # 1. Disburse milestone funds to biotech recipient (CRIT-02 Remediated)
             transfer_biotech = False
             try:
                 gl.emit_transfer(Address(milestone.biotech_recipient), u256(milestone_amt))
                 transfer_biotech = True
             except Exception:
                 transfer_biotech = False
-            if not transfer_biotech:
+
+            if transfer_biotech:
+                if int(self.total_volume_locked) >= milestone_amt:
+                    self.total_volume_locked -= u256(milestone_amt)
+                else:
+                    self.total_volume_locked = u256(0)
+            else:
                 cur = int(self.claimable_balances.get(milestone.biotech_recipient, u256(0)))
                 self.claimable_balances[milestone.biotech_recipient] = u256(cur + milestone_amt)
 
@@ -581,7 +613,13 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
                 transfer_claimant = True
             except Exception:
                 transfer_claimant = False
-            if not transfer_claimant:
+
+            if transfer_claimant:
+                if int(self.total_volume_locked) >= bond_val:
+                    self.total_volume_locked -= u256(bond_val)
+                else:
+                    self.total_volume_locked = u256(0)
+            else:
                 cur = int(self.claimable_balances.get(clm.claimant, u256(0)))
                 self.claimable_balances[clm.claimant] = u256(cur + bond_val)
 
@@ -589,6 +627,8 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
             # Frivolous claim: Forfeit claim bond to sponsor indemnity
             clm.payout_awarded = u256(0)
             clm.has_claimed = True
+            # Unlock milestone back to ACTIVE
+            milestone.status = STATUS_ACTIVE
 
             cur = int(self.claimable_balances.get(milestone.sponsor, u256(0)))
             self.claimable_balances[milestone.sponsor] = u256(cur + bond_val)
@@ -596,11 +636,8 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         else: # INCONCLUSIVE
             clm.payout_awarded = u256(0)
             clm.has_claimed = True
-
-            if int(self.total_volume_locked) >= bond_val:
-                self.total_volume_locked -= u256(bond_val)
-            else:
-                self.total_volume_locked = u256(0)
+            # Unlock milestone back to ACTIVE
+            milestone.status = STATUS_ACTIVE
 
             transfer_claimant = False
             try:
@@ -608,7 +645,13 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
                 transfer_claimant = True
             except Exception:
                 transfer_claimant = False
-            if not transfer_claimant:
+
+            if transfer_claimant:
+                if int(self.total_volume_locked) >= bond_val:
+                    self.total_volume_locked -= u256(bond_val)
+                else:
+                    self.total_volume_locked = u256(0)
+            else:
                 cur = int(self.claimable_balances.get(clm.claimant, u256(0)))
                 self.claimable_balances[clm.claimant] = u256(cur + bond_val)
 
@@ -628,7 +671,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
     def claim_abandoned_trial_bond(self, claim_id: str) -> str:
         """
         Allows claimant to recover their bond if external trial registries remain
-        unreachable for 7 days after filing.
+        unreachable for 7 days after filing. Unlocks milestone upon abandonment.
         """
         clean_c_id = claim_id.strip().upper()
         assert clean_c_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Target claim does not exist."
@@ -648,10 +691,12 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         clm.adjudication_rationale = "Recovered after 7-day registry ingestion timeout."
         self.claims[clean_c_id] = clm
 
-        if int(self.total_volume_locked) >= bond_val:
-            self.total_volume_locked -= u256(bond_val)
-        else:
-            self.total_volume_locked = u256(0)
+        # Unlock milestone back to ACTIVE
+        if clm.milestone_id in self.milestones:
+            m = self.milestones[clm.milestone_id]
+            if m.status == STATUS_DISPUTED:
+                m.status = STATUS_ACTIVE
+                self.milestones[clm.milestone_id] = m
 
         transfer_succeeded = False
         try:
@@ -660,7 +705,12 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         except Exception:
             transfer_succeeded = False
 
-        if not transfer_succeeded:
+        if transfer_succeeded:
+            if int(self.total_volume_locked) >= bond_val:
+                self.total_volume_locked -= u256(bond_val)
+            else:
+                self.total_volume_locked = u256(0)
+        else:
             cur = int(self.claimable_balances.get(sender_hex, u256(0)))
             self.claimable_balances[sender_hex] = u256(cur + bond_val)
 
@@ -701,6 +751,7 @@ class ClinicalTrialEndpointAuditEscrow(gl.Contract):
         """
         Enables parties whose native disbursements previously failed to safely withdraw
         their accumulated claimable balances. Preserves and restores balance upon failure.
+        Maintains accurate total_volume_locked upon successful withdrawal.
         """
         sender_hex = self._validate_eth_address(str(gl.message.sender), "Caller").lower()
         assert sender_hex in self.claimable_balances, \

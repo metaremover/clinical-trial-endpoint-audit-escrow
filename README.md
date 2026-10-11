@@ -4,7 +4,7 @@
 **Target Account**: [`metaremover`](https://github.com/metaremover)  
 **Repository**: [https://github.com/metaremover/clinical-trial-endpoint-audit-escrow](https://github.com/metaremover/clinical-trial-endpoint-audit-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0x85a83d5A7dd7955fF40aC5020478Bf8Ac6893236`](https://explorer-studio.genlayer.com/address/0x85a83d5A7dd7955fF40aC5020478Bf8Ac6893236)  
+**Contract Address**: [`0x61AF74c41475b052a77087aAd0E3Ae79D0A577af`](https://explorer-studio.genlayer.com/address/0x61AF74c41475b052a77087aAd0E3Ae79D0A577af)  
 
 ---
 
@@ -106,6 +106,11 @@ When clinical trial results read out:
 6. **Non-Admin Consensus Clock**: All milestone deadlines and 7-day timeout dispute periods evaluate strictly against consensus UTC timestamps (`datetime.datetime.now(datetime.timezone.utc).timestamp()`).
 7. **Timeout Bond Safeguard**: Claimants can reclaim their dispute bond after a 7-day timeout if clinical registry endpoints become unreachable.
 8. **Pull-Pattern Balance Recovery**: Failed native EVM disbursements automatically credit `claimable_balances[recipient]`. `withdraw_claimable()` optimistically zeroes the balance and restores it upon failure.
+9. **Safe Fallback on Ingestion / Parsing Glitches (CRIT-01)**: If consensus JSON parsing or LLM response formatting errors occur, verdicts default strictly to `CLAIM_INCONCLUSIVE`, protecting claimant bonds from unjust slashing.
+10. **Solvency Accounting Guarantee (CRIT-02)**: `total_volume_locked` is decremented strictly upon successful native transfer. Failed transfers retain TVL backing until funds are withdrawn via `withdraw_claimable()`, eliminating double decrements.
+11. **Dispute State Locking (HIGH-01)**: Filing a dispute immediately transitions the milestone to `STATUS_DISPUTED`, locking the state and preventing front-running milestone payout approvals or premature expiration refunds.
+12. **Prompt Sanitation Defense (HIGH-02)**: Strips HTML tags and script/style bloat via regex before prompt injection, preventing context truncation and false refutations.
+13. **Dispute Deadline Enforcement (MED-03)**: Strictly verifies that claims are submitted before the milestone deadline (`now_utc <= milestone_deadline`).
 
 ---
 
@@ -162,8 +167,8 @@ python test/test_clinical_trial_audit_escrow.py
 
 ## 6. Live Deployment & Explorer Verification
 
-- **Contract Address**: `0x85a83d5A7dd7955fF40aC5020478Bf8Ac6893236`
-- **Deployment Tx Hash**: `0x31ed224dab0fd596e598d577a4404e9ecec213c8ead96afec88169decc75a320`
+- **Contract Address**: `0x61AF74c41475b052a77087aAd0E3Ae79D0A577af`
+- **Deployment Tx Hash**: `0x64bf9228127d93abb4811a9829b332495f591d1f1fddedf21db856f14e8233c5`
 - **Network**: GenLayer Studio Testnet
-- **Explorer URL**: [https://explorer-studio.genlayer.com/address/0x85a83d5A7dd7955fF40aC5020478Bf8Ac6893236](https://explorer-studio.genlayer.com/address/0x85a83d5A7dd7955fF40aC5020478Bf8Ac6893236)
+- **Explorer URL**: [https://explorer-studio.genlayer.com/address/0x61AF74c41475b052a77087aAd0E3Ae79D0A577af](https://explorer-studio.genlayer.com/address/0x61AF74c41475b052a77087aAd0E3Ae79D0A577af)
 - **RPC Endpoint**: `https://studio.genlayer.com/api`

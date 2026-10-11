@@ -3,6 +3,7 @@
 import json
 import hashlib
 import urllib.parse
+import re
 from datetime import datetime, timezone
 
 
@@ -56,6 +57,7 @@ class MockClinicalTrialEndpointAuditEscrow:
         self.claimable_balances = {}
 
         self.STATUS_ACTIVE = "ACTIVE"
+        self.STATUS_DISPUTED = "DISPUTED"
         self.STATUS_MILESTONE_ACHIEVED = "MILESTONE_ACHIEVED"
         self.STATUS_TRIAL_FAILED_REFUNDED = "TRIAL_FAILED_REFUNDED"
         self.STATUS_EXPIRED_REFUNDED = "EXPIRED_REFUNDED"
@@ -204,11 +206,18 @@ class MockClinicalTrialEndpointAuditEscrow:
         m["milestone_escrow_amount"] = 0
 
         self.total_milestones_released += amt
-        self.total_volume_locked = max(0, self.total_volume_locked - amt)
 
+        # CRIT-02 Solvency Accounting Fix
+        transfer_succeeded = False
         try:
             self.gl.emit_transfer(m["biotech_recipient"], amt)
+            transfer_succeeded = True
         except Exception:
+            transfer_succeeded = False
+
+        if transfer_succeeded:
+            self.total_volume_locked = max(0, self.total_volume_locked - amt)
+        else:
             cur = self.claimable_balances.get(m["biotech_recipient"], 0)
             self.claimable_balances[m["biotech_recipient"]] = cur + amt
 
@@ -233,11 +242,18 @@ class MockClinicalTrialEndpointAuditEscrow:
         m["milestone_escrow_amount"] = 0
 
         self.total_milestones_refunded += amt
-        self.total_volume_locked = max(0, self.total_volume_locked - amt)
 
+        # CRIT-02 Solvency Accounting Fix
+        transfer_succeeded = False
         try:
             self.gl.emit_transfer(m["sponsor"], amt)
+            transfer_succeeded = True
         except Exception:
+            transfer_succeeded = False
+
+        if transfer_succeeded:
+            self.total_volume_locked = max(0, self.total_volume_locked - amt)
+        else:
             cur = self.claimable_balances.get(m["sponsor"], 0)
             self.claimable_balances[m["sponsor"]] = cur + amt
 
@@ -248,6 +264,9 @@ class MockClinicalTrialEndpointAuditEscrow:
         assert clean_m_id in self.milestones, "[ERR_MILESTONE_NOT_FOUND] Milestone not found."
         m = self.milestones[clean_m_id]
         assert m["status"] == self.STATUS_ACTIVE, "[ERR_MILESTONE_NOT_ACTIVE] Milestone not active."
+
+        now_utc = int(datetime.now(timezone.utc).timestamp())
+        assert now_utc <= m["milestone_deadline"], "[ERR_DEADLINE_ELAPSED] Milestone deadline has elapsed."
 
         sender_hex = self._validate_eth_address(caller, "Claimant")
         clean_url = self._validate_registry_url(url)
@@ -262,7 +281,6 @@ class MockClinicalTrialEndpointAuditEscrow:
         c_hash = self._compute_claim_hash(clean_m_id, sender_hex, m["trial_nct_id"], clean_url, clean_nonce)
         assert c_hash.lower() not in self.consumed_claim_hashes, "[ERR_CLAIM_EXISTS] Duplicate claim hash."
 
-        now_utc = int(datetime.now(timezone.utc).timestamp())
         new_c_id = "CLAIM_CLIN_" + str(self.total_claims_filed + 1)
 
         self.claims[new_c_id] = {
@@ -286,9 +304,12 @@ class MockClinicalTrialEndpointAuditEscrow:
         self.consumed_milestone_ncts[nct_key] = True
         self.total_claims_filed += 1
         self.total_volume_locked += value
+
+        # Lock milestone into DISPUTED state (HIGH-01)
+        m["status"] = self.STATUS_DISPUTED
         return new_c_id
 
-    def adjudicate_clinical_endpoint_claim(self, claim_id: str, custom_endpoint_met: bool = None, custom_p_val: float = None, custom_safety: bool = None):
+    def adjudicate_clinical_endpoint_claim(self, claim_id: str, custom_endpoint_met: bool = None, custom_p_val = None, custom_safety: bool = None, simulate_parse_error: bool = False):
         assert claim_id in self.claims, "[ERR_CLAIM_NOT_FOUND] Claim not found."
         clm = self.claims[claim_id]
         assert clm["verdict"] == self.CLAIM_PENDING, "[ERR_ALREADY_ADJUDICATED] Claim already adjudicated."
@@ -302,26 +323,61 @@ class MockClinicalTrialEndpointAuditEscrow:
 
         assert trial_text is not None and len(trial_text.strip()) >= 30, "[ERR_EVIDENCE_FETCH_FAILED] Response too short."
 
-        if custom_endpoint_met is not None and custom_p_val is not None:
+        # HTML sanitization (HIGH-02)
+        cleaned_text = re.sub(r'<script[^>]*>.*?</script>', ' ', trial_text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned_text = re.sub(r'<style[^>]*>.*?</style>', ' ', cleaned_text, flags=re.DOTALL | re.IGNORECASE)
+        cleaned_text = re.sub(r'<[^>]+>', ' ', cleaned_text)
+        cleaned_text = ' '.join(cleaned_text.split())
+
+        parse_valid = False
+        parsed_endpoint_met = False
+        parsed_p_val = 1.0
+        parsed_safety = True
+        rationale = "Consensus fallback resolution."
+
+        if simulate_parse_error:
+            parse_valid = False
+        elif custom_endpoint_met is not None and custom_p_val is not None:
             raw_resp = json.dumps({
                 "endpoint_met": custom_endpoint_met,
                 "p_value": custom_p_val,
                 "safety_hold": custom_safety if custom_safety is not None else False,
                 "rationale": "Test trial adjudication verdict."
             })
+            parsed = json.loads(raw_resp)
+            parsed_endpoint_met = bool(parsed.get("endpoint_met", False))
+            raw_pval = parsed.get("p_value", 1.0)
+            if isinstance(raw_pval, str):
+                raw_pval = raw_pval.replace("<", "").replace("=", "").replace("p", "").strip()
+            parsed_p_val = float(raw_pval)
+            parsed_safety = bool(parsed.get("safety_hold", False))
+            rationale = parsed.get("rationale", "")
+            parse_valid = True
         else:
             raw_resp = self.gl.exec_prompt("Prompt")
+            try:
+                clean_json = raw_resp.strip()
+                if "```json" in clean_json:
+                    clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+                elif "```" in clean_json:
+                    clean_json = clean_json.split("```")[1].split("```")[0].strip()
+                parsed = json.loads(clean_json)
+                parsed_endpoint_met = bool(parsed.get("endpoint_met", False))
+                raw_pval = parsed.get("p_value", 1.0)
+                if isinstance(raw_pval, str):
+                    raw_pval = raw_pval.replace("<", "").replace("=", "").replace("p", "").strip()
+                parsed_p_val = float(raw_pval)
+                parsed_safety = bool(parsed.get("safety_hold", False))
+                rationale = parsed.get("rationale", "")
+                parse_valid = True
+            except Exception:
+                parse_valid = False
 
-        parsed = json.loads(raw_resp)
-        endpoint_met = bool(parsed.get("endpoint_met", False))
-        p_val = float(parsed.get("p_value", 1.0))
-        safety_hold = bool(parsed.get("safety_hold", False))
-        rationale = parsed.get("rationale", "")
-
-        p_val_bp_derived = int(p_val * 10000)
-        if endpoint_met and p_val_bp_derived <= self.MAX_STATISTICAL_P_VALUE_BP and not safety_hold:
+        # CRIT-01 Safe Inconclusive Fallback
+        p_val_bp_derived = int(parsed_p_val * 10000)
+        if parse_valid and parsed_endpoint_met and p_val_bp_derived <= self.MAX_STATISTICAL_P_VALUE_BP and not parsed_safety:
             final_verdict = self.CLAIM_ENDPOINT_MET
-        elif not endpoint_met or p_val_bp_derived > self.MAX_STATISTICAL_P_VALUE_BP or safety_hold:
+        elif parse_valid and (not parsed_endpoint_met or p_val_bp_derived > self.MAX_STATISTICAL_P_VALUE_BP or parsed_safety):
             final_verdict = self.CLAIM_REFUTED
         else:
             final_verdict = self.CLAIM_INCONCLUSIVE
@@ -340,36 +396,60 @@ class MockClinicalTrialEndpointAuditEscrow:
             m["status"] = self.STATUS_MILESTONE_ACHIEVED
             m["total_released_to_biotech"] += escrow_amt
             m["milestone_escrow_amount"] = 0
-
             self.total_milestones_released += escrow_amt
-            total_disbursed = escrow_amt + bond_val
-            self.total_volume_locked = max(0, self.total_volume_locked - total_disbursed)
 
+            # CRIT-02 Remediated Solvency TVL Accounting
+            transfer_biotech = False
             try:
                 self.gl.emit_transfer(m["biotech_recipient"], escrow_amt)
+                transfer_biotech = True
             except Exception:
+                transfer_biotech = False
+
+            if transfer_biotech:
+                self.total_volume_locked = max(0, self.total_volume_locked - escrow_amt)
+            else:
                 cur = self.claimable_balances.get(m["biotech_recipient"], 0)
                 self.claimable_balances[m["biotech_recipient"]] = cur + escrow_amt
 
+            transfer_claimant = False
             try:
                 self.gl.emit_transfer(clm["claimant"], bond_val)
+                transfer_claimant = True
             except Exception:
+                transfer_claimant = False
+
+            if transfer_claimant:
+                self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+            else:
                 cur = self.claimable_balances.get(clm["claimant"], 0)
                 self.claimable_balances[clm["claimant"]] = cur + bond_val
 
         elif final_verdict == self.CLAIM_REFUTED:
             clm["payout_awarded"] = 0
             clm["has_claimed"] = True
+            # Unlock milestone back to ACTIVE
+            m["status"] = self.STATUS_ACTIVE
+
             cur = self.claimable_balances.get(m["sponsor"], 0)
             self.claimable_balances[m["sponsor"]] = cur + bond_val
 
-        else:
+        else: # INCONCLUSIVE
             clm["payout_awarded"] = 0
             clm["has_claimed"] = True
-            self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+            # Unlock milestone back to ACTIVE
+            m["status"] = self.STATUS_ACTIVE
+
+            transfer_claimant = False
             try:
                 self.gl.emit_transfer(clm["claimant"], bond_val)
+                transfer_claimant = True
             except Exception:
+                transfer_claimant = False
+
+            if transfer_claimant:
+                self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+            else:
                 cur = self.claimable_balances.get(clm["claimant"], 0)
                 self.claimable_balances[clm["claimant"]] = cur + bond_val
 
@@ -392,10 +472,22 @@ class MockClinicalTrialEndpointAuditEscrow:
         clm["has_claimed"] = True
         clm["adjudication_rationale"] = "Recovered after 7-day timeout."
 
-        self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+        # Unlock milestone back to ACTIVE
+        if clm["milestone_id"] in self.milestones:
+            m = self.milestones[clm["milestone_id"]]
+            if m["status"] == self.STATUS_DISPUTED:
+                m["status"] = self.STATUS_ACTIVE
+
+        transfer_claimant = False
         try:
             self.gl.emit_transfer(sender_hex, bond_val)
+            transfer_claimant = True
         except Exception:
+            transfer_claimant = False
+
+        if transfer_claimant:
+            self.total_volume_locked = max(0, self.total_volume_locked - bond_val)
+        else:
             cur = self.claimable_balances.get(sender_hex, 0)
             self.claimable_balances[sender_hex] = cur + bond_val
 
@@ -536,7 +628,13 @@ def run_all_tests():
     assert claim_id == "CLAIM_CLIN_1"
     assert contract.claims[claim_id]["claim_bond"] == bond_amount
     assert contract.total_volume_locked == escrow_amount + topup_amount + bond_amount
-    print("  PASS: Clinical endpoint claim filed with payable bond:", claim_id)
+    assert contract.milestones[milestone_id]["status"] == "DISPUTED", "Milestone must enter DISPUTED state"
+    try:
+        contract.approve_milestone_payout(caller=sponsor, milestone_id=milestone_id)
+        assert False, "Should reject payout release while milestone is DISPUTED"
+    except AssertionError as e:
+        assert "[ERR_MILESTONE_NOT_ACTIVE]" in str(e)
+    print("  PASS: Clinical endpoint claim filed with payable bond, locking milestone to DISPUTED state:", claim_id)
 
     # Phase 8: Prevent Duplicate Claim Replay
     print("\n[Phase 8] Testing replay prevention on identical trial NCT ID...")
@@ -552,7 +650,7 @@ def run_all_tests():
         )
         assert False, "Should reject duplicate NCT claim on same milestone"
     except AssertionError as e:
-        assert "[ERR_TRIAL_ALREADY_CLAIMED]" in str(e)
+        assert "[ERR_MILESTONE_NOT_ACTIVE]" in str(e) or "[ERR_TRIAL_ALREADY_CLAIMED]" in str(e)
     print("  PASS: Duplicate NCT trial claims prevented.")
 
     # Phase 9: Multi-Validator Consensus Adjudication: ENDPOINT_MET
@@ -591,10 +689,43 @@ def run_all_tests():
         endpoint_achieved=False,
         nonce="nonce_failed_trial"
     )
-    contract.adjudicate_clinical_endpoint_claim(claim_id_2, custom_endpoint_met=False, custom_p_val=0.45, custom_safety=False)
+    # Verify milestone is locked into DISPUTED state (HIGH-01)
+    assert contract.milestones[milestone_id_2]["status"] == "DISPUTED", "Milestone must enter DISPUTED state upon claim filing"
+    try:
+        contract.approve_milestone_payout(caller=sponsor, milestone_id=milestone_id_2)
+        assert False, "Should reject payout release while milestone is DISPUTED"
+    except AssertionError as e:
+        assert "[ERR_MILESTONE_NOT_ACTIVE]" in str(e)
+
+    contract.adjudicate_clinical_endpoint_claim(claim_id_2, custom_endpoint_met=False, custom_p_val="0.45", custom_safety=False)
     assert contract.claims[claim_id_2]["verdict"] == "CLAIM_REFUTED"
+    assert contract.milestones[milestone_id_2]["status"] == "ACTIVE", "Milestone must unlock to ACTIVE after refutation"
     assert contract.claimable_balances[sponsor] == bond_amount, "Sponsor credited with slashed bond indemnity"
     print("  PASS: Failed endpoint claim bond slashed to sponsor indemnity reserves.")
+
+    # Phase 10b: Corrupt JSON / Parse Failure Safe Fallback (CRIT-01)
+    print("\n[Phase 10b] Testing AI parse error safe fallback (CLAIM_INCONCLUSIVE, bond preserved)...")
+    milestone_id_safe = contract.create_clinical_milestone_escrow(
+        caller=sponsor,
+        value=escrow_amount,
+        biotech_recipient=biotech,
+        nct_id="NCT07777777",
+        endpoint="Biomarker response rate",
+        duration_sec=86400 * 60
+    )
+    claim_id_safe = contract.submit_clinical_endpoint_claim(
+        caller=claimant,
+        value=bond_amount,
+        milestone_id=milestone_id_safe,
+        url="https://clinicaltrials.gov/study/NCT07777777",
+        p_val_bp=100,
+        endpoint_achieved=True,
+        nonce="nonce_parse_err_test"
+    )
+    contract.adjudicate_clinical_endpoint_claim(claim_id_safe, simulate_parse_error=True)
+    assert contract.claims[claim_id_safe]["verdict"] == "INCONCLUSIVE", "Parse failure must yield INCONCLUSIVE"
+    assert contract.milestones[milestone_id_safe]["status"] == "ACTIVE", "Milestone must unlock back to ACTIVE"
+    print("  PASS: AI parsing glitch safely fell back to INCONCLUSIVE without bond slashing.")
 
     # Phase 11: Fail-Closed Web Evidence Ingestion
     print("\n[Phase 11] Testing fail-closed handling on unreachable trial portal...")
