@@ -49,7 +49,9 @@ class MockGL:
         self.nondet = MockNondet(self)
         self.eq_principle = MockEqPrinciple(self)
         self.consensus_return_value = json.dumps({
+            "trial_id": "NCT04589211",
             "nct_matched": True,
+            "endpoint_achieved": True,
             "endpoint_met": True,
             "p_value": 0.0018,
             "safety_hold": False,
@@ -363,11 +365,13 @@ class MockClinicalTrialEndpointAuditEscrow:
         elif custom_endpoint_met is not None and custom_p_val is not None:
             self.gl.corrupt_llm_json = False
             self.gl.consensus_return_value = json.dumps({
+                "trial_id": nct_id,
                 "nct_matched": True,
+                "endpoint_achieved": custom_endpoint_met,
                 "endpoint_met": custom_endpoint_met,
                 "p_value": custom_p_val,
                 "safety_hold": custom_safety if custom_safety is not None else False,
-                "verdict": "ENDPOINT_ACHIEVED" if custom_endpoint_met else "ENDPOINT_FAILED",
+                "verdict": "ENDPOINT_ACHIEVED" if (custom_endpoint_met and custom_p_val < 0.05 and not (custom_safety if custom_safety is not None else False)) else "ENDPOINT_FAILED",
                 "rationale": "Test trial adjudication verdict."
             })
         else:
@@ -380,9 +384,11 @@ class MockClinicalTrialEndpointAuditEscrow:
         )
 
         parse_valid = False
-        parsed_endpoint_met = False
+        parsed_trial_id = ""
+        parsed_endpoint_achieved = False
         parsed_p_val = 1.0
         parsed_safety = True
+        parsed_verdict = self.CLAIM_INCONCLUSIVE
         rationale = "Consensus fallback resolution."
 
         try:
@@ -392,23 +398,58 @@ class MockClinicalTrialEndpointAuditEscrow:
             elif "```" in clean_json:
                 clean_json = clean_json.split("```")[1].split("```")[0].strip()
             parsed = json.loads(clean_json)
-            parsed_endpoint_met = bool(parsed.get("endpoint_met", False))
+
+            parsed_trial_id = str(parsed.get("trial_id", "")).strip().upper()
+            if not parsed_trial_id:
+                parsed_trial_id = str(parsed.get("nct_id", "")).strip().upper()
+
+            parsed_endpoint_achieved = bool(parsed.get("endpoint_achieved", False) or parsed.get("endpoint_met", False))
+
             raw_pval = parsed.get("p_value", 1.0)
             if isinstance(raw_pval, str):
                 raw_pval = raw_pval.replace("<", "").replace("=", "").replace("p", "").strip()
             parsed_p_val = float(raw_pval)
+
             parsed_safety = bool(parsed.get("safety_hold", False))
-            rationale = parsed.get("rationale", "")
+
+            raw_cand = str(parsed.get("verdict", "")).strip().upper()
+            if raw_cand in ("ENDPOINT_ACHIEVED", "ENDPOINT_MET", self.CLAIM_ENDPOINT_MET):
+                parsed_verdict = self.CLAIM_ENDPOINT_MET
+            elif raw_cand in ("ENDPOINT_FAILED", self.CLAIM_REFUTED):
+                parsed_verdict = self.CLAIM_REFUTED
+            else:
+                parsed_verdict = self.CLAIM_INCONCLUSIVE
+
+            rationale = str(parsed.get("rationale", "")).strip()[:200]
             parse_valid = True
         except Exception:
             parse_valid = False
 
-        # CRIT-01 Safe Inconclusive Fallback
-        p_val_bp_derived = int(parsed_p_val * 10000)
-        if parse_valid and parsed_endpoint_met and p_val_bp_derived <= self.MAX_STATISTICAL_P_VALUE_BP and not parsed_safety:
+        # Strict Multi-Field Consistency Check (Joaquin Steward Specification)
+        is_trial_id_matched = (parsed_trial_id == m["trial_nct_id"].strip().upper())
+        is_endpoint_achieved = (parsed_endpoint_achieved is True)
+        is_strict_p_val_valid = (parsed_p_val < 0.05 and parsed_p_val >= 0.0)
+        is_no_safety_hold = (parsed_safety is False)
+        is_verdict_achieved = (parsed_verdict == self.CLAIM_ENDPOINT_MET)
+
+        # Consistent Milestone Achievement
+        if (parse_valid and
+            is_trial_id_matched and
+            is_endpoint_achieved and
+            is_strict_p_val_valid and
+            is_no_safety_hold and
+            is_verdict_achieved):
             final_verdict = self.CLAIM_ENDPOINT_MET
-        elif parse_valid and (not parsed_endpoint_met or p_val_bp_derived > self.MAX_STATISTICAL_P_VALUE_BP or parsed_safety):
+
+        # Consistent Milestone Failure
+        elif (parse_valid and
+              is_trial_id_matched and
+              (not is_endpoint_achieved or parsed_p_val >= 0.05 or parsed_safety) and
+              parsed_verdict == self.CLAIM_REFUTED):
             final_verdict = self.CLAIM_REFUTED
+
+        # Any mismatched trial ID, internally inconsistent fields, parsing error, or ambiguity:
+        # Takes safe non-payout path (CLAIM_INCONCLUSIVE)
         else:
             final_verdict = self.CLAIM_INCONCLUSIVE
 
@@ -756,6 +797,74 @@ def run_all_tests():
     assert contract.claims[claim_id_safe]["verdict"] == "INCONCLUSIVE", "Parse failure must yield INCONCLUSIVE"
     assert contract.milestones[milestone_id_safe]["status"] == "ACTIVE", "Milestone must unlock back to ACTIVE"
     print("  PASS: AI parsing glitch safely fell back to INCONCLUSIVE without bond slashing.")
+
+    # Phase 10c: Joaquin Invariant - Mismatched Trial NCT ID Safe Non-Payout Path
+    print("\n[Phase 10c] Testing Joaquin Invariant: Mismatched trial NCT ID safe non-payout path...")
+    milestone_id_mismatch = contract.create_clinical_milestone_escrow(
+        caller=sponsor,
+        value=escrow_amount,
+        biotech_recipient=biotech,
+        nct_id="NCT01112222",
+        endpoint="Overall Response Rate ORR > 40%",
+        duration_sec=86400 * 60
+    )
+    claim_id_mismatch = contract.submit_clinical_endpoint_claim(
+        caller=claimant,
+        value=bond_amount,
+        milestone_id=milestone_id_mismatch,
+        url="https://clinicaltrials.gov/study/NCT01112222",
+        p_val_bp=100,
+        endpoint_achieved=True,
+        nonce="nonce_mismatch_test"
+    )
+    # Simulate LLM consensus returning a mismatched trial ID from the page
+    mock_gl.consensus_return_value = json.dumps({
+        "trial_id": "NCT09990000",  # WRONG TRIAL ID!
+        "endpoint_achieved": True,
+        "p_value": 0.001,
+        "safety_hold": False,
+        "verdict": "ENDPOINT_ACHIEVED",
+        "rationale": "Readout achieves endpoint but matches wrong trial ID."
+    })
+    contract.adjudicate_clinical_endpoint_claim(claim_id_mismatch)
+    assert contract.claims[claim_id_mismatch]["verdict"] == "INCONCLUSIVE", "Mismatched trial ID must take safe non-payout path (INCONCLUSIVE)"
+    assert contract.milestones[milestone_id_mismatch]["status"] == "ACTIVE", "Milestone must stay active without unauthorized payout"
+    assert contract.milestones[milestone_id_mismatch]["total_released_to_biotech"] == 0, "No milestone payout permitted on mismatched trial ID"
+    print("  PASS: Mismatched trial NCT ID successfully routed to safe non-payout path (INCONCLUSIVE).")
+
+    # Phase 10d: Joaquin Invariant - Internally Inconsistent Consensus Output Safe Non-Payout Path
+    print("\n[Phase 10d] Testing Joaquin Invariant: Internally inconsistent consensus output...")
+    milestone_id_inconsistent = contract.create_clinical_milestone_escrow(
+        caller=sponsor,
+        value=escrow_amount,
+        biotech_recipient=biotech,
+        nct_id="NCT03334444",
+        endpoint="Progression-Free Survival PFS",
+        duration_sec=86400 * 60
+    )
+    claim_id_inconsistent = contract.submit_clinical_endpoint_claim(
+        caller=claimant,
+        value=bond_amount,
+        milestone_id=milestone_id_inconsistent,
+        url="https://clinicaltrials.gov/study/NCT03334444",
+        p_val_bp=100,
+        endpoint_achieved=True,
+        nonce="nonce_inconsistent_test"
+    )
+    # Simulate LLM claiming ENDPOINT_ACHIEVED but safety_hold is True (Internally Inconsistent!)
+    mock_gl.consensus_return_value = json.dumps({
+        "trial_id": "NCT03334444",
+        "endpoint_achieved": True,
+        "p_value": 0.002,
+        "safety_hold": True,  # CONFLICT: Efficacy met, but active safety hold!
+        "verdict": "ENDPOINT_ACHIEVED",  # Inconsistent verdict!
+        "rationale": "Conflicting readout: efficacy claimed but safety hold active."
+    })
+    contract.adjudicate_clinical_endpoint_claim(claim_id_inconsistent)
+    assert contract.claims[claim_id_inconsistent]["verdict"] == "INCONCLUSIVE", "Internally inconsistent consensus must take safe non-payout path"
+    assert contract.milestones[milestone_id_inconsistent]["status"] == "ACTIVE", "Milestone must not disburse funds on inconsistent output"
+    assert contract.milestones[milestone_id_inconsistent]["total_released_to_biotech"] == 0
+    print("  PASS: Internally inconsistent consensus fields safely routed to non-payout path (INCONCLUSIVE).")
 
     # Phase 11: Fail-Closed Web Evidence Ingestion
     print("\n[Phase 11] Testing fail-closed handling on unreachable trial portal...")

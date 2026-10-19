@@ -1,12 +1,12 @@
 {
   "contractName": "ClinicalTrialEndpointAuditEscrow",
-  "contractAddress": "0x05aeFfE06ea65908223F747f722e6980b08eee0b",
-  "transactionHash": "0x1045bddfe3274115698c3a422ccf5aff6f32f762a8e7892c75d96fbb07b68a5a",
-  "deployerAddress": "0xd1fB28E8B46244dF773b31B0D316E9769597E66f",
+  "contractAddress": "0x180b8071498520CCB7954702488A97cDBA801Ba1",
+  "transactionHash": "0x3872e48ef5c21868ca1a980b9796a80843c0cda513b12f78f17f4adec0798ea5",
+  "deployerAddress": "0x3655ea696d1EcadCE958F8fD3FbD0655DC55f604",
   "network": "GenLayer Studio Testnet",
   "rpcEndpoint": "https://studio.genlayer.com/api",
-  "explorerUrl": "https://explorer-studio.genlayer.com/address/0x05aeFfE06ea65908223F747f722e6980b08eee0b",
-  "deployedAt": "2026-10-11T20:11:19.437Z",
+  "explorerUrl": "https://explorer-studio.genlayer.com/address/0x180b8071498520CCB7954702488A97cDBA801Ba1",
+  "deployedAt": "2026-10-19T00:10:31.202Z",
   "initialState": {
     "totalMilestonesCreated": 0,
     "totalVolumeLockedWei": "0",

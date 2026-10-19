@@ -3,7 +3,7 @@
 **Protocol Standard**: GenLayer Intelligent Contract v0.2.1  
 **Repository**: [https://github.com/metaremover/clinical-trial-endpoint-audit-escrow](https://github.com/metaremover/clinical-trial-endpoint-audit-escrow)  
 **Execution Environment**: GenLayer Studio Testnet  
-**Contract Address**: [`0x05aeFfE06ea65908223F747f722e6980b08eee0b`](https://explorer-studio.genlayer.com/address/0x05aeFfE06ea65908223F747f722e6980b08eee0b)  
+**Contract Address**: [`0x180b8071498520CCB7954702488A97cDBA801Ba1`](https://explorer-studio.genlayer.com/address/0x180b8071498520CCB7954702488A97cDBA801Ba1)  
 
 ---
 
@@ -166,8 +166,8 @@ python test/test_clinical_trial_audit_escrow.py
 
 ## 6. Live Deployment & Explorer Verification
 
-- **Contract Address**: `0x61AF74c41475b052a77087aAd0E3Ae79D0A577af`
-- **Deployment Tx Hash**: `0x64bf9228127d93abb4811a9829b332495f591d1f1fddedf21db856f14e8233c5`
+- **Contract Address**: `0x180b8071498520CCB7954702488A97cDBA801Ba1`
+- **Deployment Tx Hash**: `0x3872e48ef5c21868ca1a980b9796a80843c0cda513b12f78f17f4adec0798ea5`
 - **Network**: GenLayer Studio Testnet
-- **Explorer URL**: [https://explorer-studio.genlayer.com/address/0x61AF74c41475b052a77087aAd0E3Ae79D0A577af](https://explorer-studio.genlayer.com/address/0x61AF74c41475b052a77087aAd0E3Ae79D0A577af)
+- **Explorer URL**: [https://explorer-studio.genlayer.com/address/0x180b8071498520CCB7954702488A97cDBA801Ba1](https://explorer-studio.genlayer.com/address/0x180b8071498520CCB7954702488A97cDBA801Ba1)
 - **RPC Endpoint**: `https://studio.genlayer.com/api`
